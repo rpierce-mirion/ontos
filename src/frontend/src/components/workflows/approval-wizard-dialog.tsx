@@ -87,7 +87,20 @@ export interface ApprovalWizardDialogProps {
   onBehalfOf?: { type: string; value: string } | null;
   /** When true and preselectedWorkflowId is set, start session immediately without showing workflow list. */
   autoStartWithPreselected?: boolean;
-  onComplete?: (agreementId: string | null, pdfStoragePath: string | null) => void;
+  /**
+   * Fired when the wizard completes (or when the user closes after success).
+   *
+   * ``wizardFields`` is an aggregated map of every field collected from
+   * ``user_action`` steps across the session — keyed by ``required_fields[].id``.
+   * It is the FE pass-through that lets request-action call sites merge custom
+   * fields the workflow author defined into the eventual API submit body
+   * without the call site needing to know the workflow shape.
+   */
+  onComplete?: (
+    agreementId: string | null,
+    pdfStoragePath: string | null,
+    wizardFields?: Record<string, unknown>,
+  ) => void;
   /** Called when no workflow is available so the caller can proceed directly. */
   onNoWorkflow?: () => void;
 }
@@ -124,6 +137,13 @@ export default function ApprovalWizardDialog({
   const [workflowsLoaded, setWorkflowsLoaded] = useState(false);
   /** Ref to prevent duplicate auto-submit for non-visual steps. */
   const autoSubmitRef = useRef<string | null>(null);
+  /**
+   * Aggregated map of every field collected from ``user_action`` steps across
+   * the session, keyed by ``required_fields[].id``. Surfaced via ``onComplete``
+   * so request-action call sites can merge wizard-collected fields into the
+   * eventual API submit body without knowing the workflow shape.
+   */
+  const collectedFieldsRef = useRef<Record<string, unknown>>({});
   /** Legal document: tracks whether user scrolled to bottom. */
   const [scrolledToEnd, setScrolledToEnd] = useState(false);
   /** Legal document: tracks acknowledgement checkbox state. */
@@ -163,6 +183,7 @@ export default function ApprovalWizardDialog({
     setStepNames([]);
     setWorkflowsLoaded(false);
     autoSubmitRef.current = null;
+    collectedFieldsRef.current = {};
     setScrolledToEnd(false);
     setAcknowledged(false);
     setChecklistState({});
@@ -358,6 +379,11 @@ export default function ApprovalWizardDialog({
     setLoading(true);
     try {
       const submissionPayload = currentStep.step_type === 'user_action' ? payload : stepValidation.payload;
+      // Aggregate user_action fields into collectedFieldsRef so onComplete can
+      // surface them to request-action call sites for pass-through.
+      if (currentStep.step_type === 'user_action' && submissionPayload && typeof submissionPayload === 'object') {
+        collectedFieldsRef.current = { ...collectedFieldsRef.current, ...submissionPayload };
+      }
       const res = await post<{ complete?: boolean; agreement_id?: string; pdf_storage_path?: string; pdf_url?: string; current_step?: WizardStep; step_results?: unknown[] }>(
         `/api/approvals/sessions/${sessionId}/steps`,
         { step_id: currentStep.step_id, payload: submissionPayload },
@@ -434,7 +460,7 @@ export default function ApprovalWizardDialog({
   const handleDialogOpenChange = (open: boolean) => {
     if (!open && completeResult) {
       // Closing after completion — fire onComplete
-      onComplete?.(completeResult.agreement_id, completeResult.pdf_storage_path);
+      onComplete?.(completeResult.agreement_id, completeResult.pdf_storage_path, { ...collectedFieldsRef.current });
     } else if (!open && !completeResult) {
       // User closed via X or escape mid-flow — treat as cancel
       toast({ title: 'Cancelled', variant: 'default' });
@@ -521,7 +547,7 @@ export default function ApprovalWizardDialog({
             )}
             <DialogFooter>
               <Button onClick={() => {
-                onComplete?.(completeResult.agreement_id, completeResult.pdf_storage_path);
+                onComplete?.(completeResult.agreement_id, completeResult.pdf_storage_path, { ...collectedFieldsRef.current });
                 onOpenChange(false);
               }}>Close</Button>
             </DialogFooter>

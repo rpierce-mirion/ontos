@@ -7,11 +7,29 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useToast } from '@/hooks/use-toast';
 import { useApi } from '@/hooks/use-api';
+import { useApprovalWizardTrigger, type AppActionTriggerType } from '@/hooks/use-approval-wizard-trigger';
 import { useNotificationsStore } from '@/stores/notifications-store';
 import { Loader2, AlertCircle, FileText, Eye, Rocket, RefreshCw, ShieldCheck } from 'lucide-react';
 import AccessRequestFields from '@/components/access/access-request-fields';
+import ApprovalWizardDialog from '@/components/workflows/approval-wizard-dialog';
 
 type RequestType = 'access' | 'review' | 'publish' | 'certify' | 'status_change';
+
+/**
+ * Map request type → app-action trigger type for approval-wizard lookup.
+ *
+ * Closes the wiring gap from PR #318: Subscribe was the only path that invoked
+ * the wizard, even though all six ``for_request_*`` triggers existed in the
+ * backend. Each request type below opens the same ApprovalWizardDialog when a
+ * workflow is configured, falling through to today's direct-submit otherwise.
+ */
+const REQUEST_TYPE_TO_TRIGGER: Record<RequestType, AppActionTriggerType> = {
+  access: 'for_request_access',
+  review: 'for_request_review',
+  publish: 'for_request_publish',
+  certify: 'for_request_certify',
+  status_change: 'for_request_status_change',
+};
 
 interface CertificationLevelOption {
   id: string;
@@ -83,6 +101,7 @@ export default function RequestProductActionDialog({
 }: RequestProductActionDialogProps) {
   const { post, get } = useApi();
   const { toast } = useToast();
+  const { lookupWorkflowId } = useApprovalWizardTrigger();
   const refreshNotifications = useNotificationsStore((state) => state.refreshNotifications);
 
   const [requestType, setRequestType] = useState<RequestType>(defaultRequestType);
@@ -95,6 +114,21 @@ export default function RequestProductActionDialog({
   const [certificationLevel, setCertificationLevel] = useState<number | null>(null);
   const [certificationLevels, setCertificationLevels] = useState<CertificationLevelOption[]>([]);
   const [publicationScope, setPublicationScope] = useState('organization');
+
+  // Approval wizard launch state.
+  // When a `for_request_*` workflow is configured, we open the wizard before
+  // the original direct-submit fires; on wizard completion the collected
+  // wizard fields are merged into the submit body. When no workflow is
+  // configured, this dialog falls through to today's direct-submit flow.
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [wizardWorkflowId, setWizardWorkflowId] = useState<string | null>(null);
+  // Stashed submit context — captured at the moment Submit is clicked so the
+  // wizard's onComplete can replay the API call with merged fields.
+  const [pendingSubmit, setPendingSubmit] = useState<{
+    endpoint: string;
+    payload: Record<string, unknown>;
+    requestType: RequestType;
+  } | null>(null);
 
   useEffect(() => {
     get<CertificationLevelOption[]>('/api/certification-levels').then(({ data }) => {
@@ -208,6 +242,100 @@ export default function RequestProductActionDialog({
     return true;
   };
 
+  /**
+   * Build the request body for the chosen request type.
+   * Returns ``null`` when validation fails (callers have already surfaced an error).
+   */
+  const buildPayload = (type: RequestType): Record<string, unknown> | null => {
+    if (type === 'access') {
+      return {
+        entity_type: 'data_product',
+        entity_id: productId,
+        reason: message.trim(),
+        requested_permission_level: 'READ',
+        requested_duration_days: selectedDuration,
+      };
+    } else if (type === 'review') {
+      return {
+        message: message.trim() || undefined,
+      };
+    } else if (type === 'publish') {
+      return {
+        scope: publicationScope,
+        justification: justification.trim() || undefined,
+      };
+    } else if (type === 'certify') {
+      if (!certificationLevel) {
+        setError('Please select a certification level');
+        return null;
+      }
+      return {
+        certification_level: certificationLevel,
+        message: message.trim() || undefined,
+      };
+    } else if (type === 'status_change') {
+      if (canDirectStatusChange) {
+        return { new_status: targetStatus };
+      }
+      return {
+        target_status: targetStatus,
+        justification: justification.trim(),
+        current_status: productStatus,
+      };
+    }
+    return null;
+  };
+
+  /**
+   * Execute the actual API submit. Called either directly from handleSubmit
+   * (when no wizard is configured) or from the wizard's onComplete (with
+   * merged wizard fields).
+   */
+  const executeSubmit = async (
+    endpoint: string,
+    payload: Record<string, unknown>,
+    type: RequestType,
+  ) => {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const response = await post(endpoint, payload);
+      if (response.error) {
+        throw new Error(response.error);
+      }
+      // Different success messages for direct changes vs requests
+      if (type === 'status_change' && canDirectStatusChange) {
+        toast({
+          title: 'Status Changed',
+          description: `Product status changed from "${productStatus}" to "${targetStatus}".`,
+        });
+      } else {
+        toast({
+          title: 'Request Submitted',
+          description: `Your ${type} request has been submitted and you will be notified of the decision.`,
+        });
+      }
+      refreshNotifications();
+      if (onSuccess) onSuccess();
+      // Reset form and close dialog
+      setMessage('');
+      setJustification('');
+      setTargetStatus('');
+      setCertificationLevel(null);
+      setPublicationScope('organization');
+      onOpenChange(false);
+    } catch (e: any) {
+      setError(e.message || 'Failed to submit request');
+      toast({
+        title: 'Error',
+        description: e.message || 'Failed to submit request',
+        variant: 'destructive',
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const handleSubmit = async () => {
     if (!validateForm()) {
       return;
@@ -219,104 +347,61 @@ export default function RequestProductActionDialog({
       return;
     }
 
-    setError(null);
-    setSubmitting(true);
+    const payload = buildPayload(requestType);
+    if (!payload) return;
 
-    try {
-      let payload: any;
-      
-      if (requestType === 'access') {
-        payload = {
-          entity_type: 'data_product',
-          entity_id: productId,
-          reason: message.trim(),
-          requested_permission_level: 'READ',
-          requested_duration_days: selectedDuration,
-        };
-      } else if (requestType === 'review') {
-        payload = {
-          message: message.trim() || undefined,
-        };
-      } else if (requestType === 'publish') {
-        payload = {
-          scope: publicationScope,
-          justification: justification.trim() || undefined,
-        };
-      } else if (requestType === 'certify') {
-        if (!certificationLevel) {
-          setError('Please select a certification level');
-          setSubmitting(false);
-          return;
-        }
-        payload = {
-          certification_level: certificationLevel,
-          message: message.trim() || undefined,
-        };
-      } else if (requestType === 'status_change') {
-        if (canDirectStatusChange) {
-          payload = {
-            new_status: targetStatus,
-          };
-        } else {
-          payload = {
-            target_status: targetStatus,
-            justification: justification.trim(),
-            current_status: productStatus,
-          };
-        }
-      }
-
-      const response = await post(config.endpoint, payload);
-
-      if (response.error) {
-        throw new Error(response.error);
-      }
-
-      // Different success messages for direct changes vs requests
-      if (requestType === 'status_change' && canDirectStatusChange) {
-        toast({
-          title: 'Status Changed',
-          description: `Product status changed from "${productStatus}" to "${targetStatus}".`
-        });
-      } else {
-        toast({
-          title: 'Request Submitted',
-          description: `Your ${requestType} request has been submitted and you will be notified of the decision.`
-        });
-      }
-
-      // Refresh notifications
-      refreshNotifications();
-
-      // Call success callback
-      if (onSuccess) {
-        onSuccess();
-      }
-
-      // Reset form and close dialog
-      setMessage('');
-      setJustification('');
-      setTargetStatus('');
-      setCertificationLevel(null);
-      setPublicationScope('organization');
-      onOpenChange(false);
-
-    } catch (e: any) {
-      setError(e.message || 'Failed to submit request');
-      toast({
-        title: 'Error',
-        description: e.message || 'Failed to submit request',
-        variant: 'destructive'
-      });
-    } finally {
-      setSubmitting(false);
+    // Direct-status-change skips the wizard (it's an admin operation, not a request).
+    if (requestType === 'status_change' && canDirectStatusChange) {
+      await executeSubmit(config.endpoint, payload, requestType);
+      return;
     }
+
+    // Try to launch the approval wizard for this request type. When no
+    // workflow is configured (or lookup fails), fall through to direct submit.
+    const triggerType = REQUEST_TYPE_TO_TRIGGER[requestType];
+    setSubmitting(true);
+    let workflowId: string | null = null;
+    try {
+      workflowId = await lookupWorkflowId(triggerType);
+    } catch {
+      workflowId = null;
+    }
+    setSubmitting(false);
+
+    if (workflowId) {
+      // Stash the submit context so onComplete can replay it with merged fields.
+      setPendingSubmit({ endpoint: config.endpoint, payload, requestType });
+      setWizardWorkflowId(workflowId);
+      setWizardOpen(true);
+    } else {
+      await executeSubmit(config.endpoint, payload, requestType);
+    }
+  };
+
+  const handleWizardComplete = async (
+    _agreementId: string | null,
+    _pdfStoragePath: string | null,
+    wizardFields?: Record<string, unknown>,
+  ) => {
+    if (!pendingSubmit) return;
+    const merged = {
+      ...pendingSubmit.payload,
+      // Wizard-collected fields land in a dedicated namespace so the BE can
+      // forward them into ``entity_data`` for downstream Process workflows
+      // without colliding with first-class request fields (reason, duration).
+      wizard_data: wizardFields ?? {},
+    };
+    setWizardOpen(false);
+    setWizardWorkflowId(null);
+    setPendingSubmit(null);
+    await executeSubmit(pendingSubmit.endpoint, merged, pendingSubmit.requestType);
   };
 
   const allowedTransitions = productStatus ? getAllowedTransitions(productStatus) : [];
   const config = getRequestTypeConfig(requestType);
 
   return (
+    <>
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-lg">
         <DialogHeader>
@@ -538,5 +623,29 @@ export default function RequestProductActionDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+    {/* Approval wizard — opens when a `for_request_*` workflow is configured
+        for the chosen request type. On completion, replays the submit with
+        wizard-collected fields merged into the body. */}
+    {wizardWorkflowId && (
+      <ApprovalWizardDialog
+        isOpen={wizardOpen}
+        onOpenChange={(open) => {
+          setWizardOpen(open);
+          if (!open && pendingSubmit) {
+            // User dismissed wizard mid-flow — drop the pending submit so the
+            // dialog stays open for the user to retry/cancel.
+            setPendingSubmit(null);
+            setWizardWorkflowId(null);
+          }
+        }}
+        entityType="data_product"
+        entityId={productId}
+        entityName={productName}
+        preselectedWorkflowId={wizardWorkflowId}
+        autoStartWithPreselected
+        onComplete={handleWizardComplete}
+      />
+    )}
+    </>
   );
 }

@@ -11,6 +11,7 @@ import SupportChannelFormDialog from '@/components/data-products/support-channel
 import ImportExportDialog from '@/components/data-products/import-export-dialog';
 import ImportTeamMembersDialog from '@/components/data-contracts/import-team-members-dialog';
 import { useApi } from '@/hooks/use-api';
+import { useApprovalWizardTrigger } from '@/hooks/use-approval-wizard-trigger';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Loader2, Pencil, Trash2, AlertCircle, Sparkles, CopyPlus, ArrowLeft, Package, KeyRound, Plus, FileText, Download, Bell, BellOff, Users, ShieldCheck, Globe } from 'lucide-react';
@@ -222,6 +223,7 @@ export default function DataProductDetails() {
   const listPath = pathname.replace(/\/[^/]+$/, '');
   const api = useApi();
   const { get, post, delete: deleteApi } = api;
+  const { lookupWorkflowId } = useApprovalWizardTrigger();
   const { toast } = useToast();
   const setDynamicTitle = useBreadcrumbStore((state) => state.setDynamicTitle);
   const setStaticSegments = useBreadcrumbStore((state) => state.setStaticSegments);
@@ -569,20 +571,11 @@ export default function DataProductDetails() {
   // Subscription: open approval wizard (or fallback to direct subscribe)
   const handleSubscribeClick = async () => {
     if (!productId) return;
-    try {
-      const res = await get<{ id: string }>('/api/workflows/for-trigger/for_subscribe');
-      if (res.data?.id) {
-        setSubscriptionWorkflowId(res.data.id);
-        setSubscriptionWizardOpen(true);
-      } else {
-        toast({
-          title: 'Approval workflow not configured',
-          description: 'Subscribing directly. Load default workflows in Settings to use the approval flow.',
-          variant: 'default',
-        });
-        await handleSubscribeDirect();
-      }
-    } catch {
+    const workflowId = await lookupWorkflowId('for_subscribe');
+    if (workflowId) {
+      setSubscriptionWorkflowId(workflowId);
+      setSubscriptionWizardOpen(true);
+    } else {
       toast({
         title: 'Approval workflow not configured',
         description: 'Subscribing directly. Load default workflows in Settings to use the approval flow.',

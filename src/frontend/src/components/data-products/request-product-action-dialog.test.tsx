@@ -6,22 +6,59 @@
  * static text rendered by the dialog header — which is driven directly by the
  * initial request-type state.
  */
-import { screen } from '@testing-library/react';
+import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderWithProviders } from '@/test/utils';
 import RequestProductActionDialog from './request-product-action-dialog';
 
-// Mock hooks that hit external services
+// Mock hooks that hit external services. ``mockGet``/``mockPost`` are mutated
+// per test so we can drive the wizard-launch branch deterministically.
+const mockGet = vi.fn();
+const mockPost = vi.fn();
+const mockLookupWorkflowId = vi.fn();
+
 vi.mock('@/hooks/use-toast', () => ({
   useToast: () => ({ toast: vi.fn() })
 }));
 
 vi.mock('@/hooks/use-api', () => ({
   useApi: () => ({
-    get: vi.fn().mockResolvedValue({ data: [] }),
-    post: vi.fn().mockResolvedValue({ data: null })
+    get: mockGet,
+    post: mockPost,
   })
 }));
+
+vi.mock('@/hooks/use-approval-wizard-trigger', async () => {
+  // Re-export the type-only ``AppActionTriggerType`` from the real module so
+  // this mock stays in sync if the union changes upstream.
+  const actual = await vi.importActual<typeof import('@/hooks/use-approval-wizard-trigger')>(
+    '@/hooks/use-approval-wizard-trigger',
+  );
+  return {
+    ...actual,
+    useApprovalWizardTrigger: () => ({ lookupWorkflowId: mockLookupWorkflowId }),
+  };
+});
+
+// ApprovalWizardDialog is mocked to a controllable harness so we can synthesize
+// onComplete with arbitrary wizardFields without driving the real wizard.
+vi.mock('@/components/workflows/approval-wizard-dialog', () => {
+  return {
+    default: ({ isOpen, preselectedWorkflowId, onComplete }: any) =>
+      isOpen ? (
+        <div data-testid="wizard-mock" data-workflow-id={preselectedWorkflowId}>
+          <button
+            data-testid="wizard-complete-btn"
+            onClick={() =>
+              onComplete?.('agr-123', null, { custom_field: 'foo', urgency: 'high' })
+            }
+          >
+            Complete
+          </button>
+        </div>
+      ) : null,
+  };
+});
 
 vi.mock('@/stores/notifications-store', () => ({
   useNotificationsStore: (selector: any) =>
@@ -31,6 +68,9 @@ vi.mock('@/stores/notifications-store', () => ({
 describe('RequestProductActionDialog default request type', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGet.mockResolvedValue({ data: [] });
+    mockPost.mockResolvedValue({ data: { id: 'req-1' } });
+    mockLookupWorkflowId.mockResolvedValue(null);
   });
 
   it("defaults to 'access' when defaultRequestType is not provided", () => {
@@ -89,5 +129,121 @@ describe('RequestProductActionDialog default request type', () => {
     expect(
       screen.getByRole('heading', { name: /Change Status/ })
     ).toBeInTheDocument();
+  });
+});
+
+/**
+ * Path-B portable wizard launch — when a ``for_request_*`` workflow is
+ * configured for the chosen request type, Submit must open the wizard before
+ * the original API call fires; on wizard completion the collected fields are
+ * merged into the submit body. When no workflow is configured, Submit falls
+ * through to today's direct-submit behavior.
+ */
+describe('RequestProductActionDialog approval-wizard launch (Path B)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet.mockResolvedValue({ data: [] });
+    mockPost.mockResolvedValue({ data: { id: 'req-1' } });
+  });
+
+  it('falls through to direct submit when no for_request_access workflow is configured', async () => {
+    mockLookupWorkflowId.mockResolvedValue(null);
+
+    renderWithProviders(
+      <RequestProductActionDialog
+        isOpen={true}
+        onOpenChange={vi.fn()}
+        productId="prod-1"
+        productName="Test Product"
+        productStatus="active"
+      />,
+    );
+
+    // Fill in a valid reason (>=10 chars) and submit.
+    // The reason field uses i18n keys for the label which may resolve to the
+    // raw key in tests; locate by the stable element id used in the source.
+    const reasonField = document.getElementById('access-message') as HTMLTextAreaElement;
+    expect(reasonField).not.toBeNull();
+    fireEvent.change(reasonField, { target: { value: 'Need access for the Q3 analytics rollup.' } });
+    fireEvent.click(screen.getByRole('button', { name: /Send Request/i }));
+
+    await waitFor(() => {
+      expect(mockLookupWorkflowId).toHaveBeenCalledWith('for_request_access');
+    });
+    await waitFor(() => {
+      expect(mockPost).toHaveBeenCalledTimes(1);
+    });
+    // Direct submit — no wizard rendered, no wizard_data on the body.
+    expect(screen.queryByTestId('wizard-mock')).toBeNull();
+    const [endpoint, body] = mockPost.mock.calls[0];
+    expect(endpoint).toBe('/api/access-grants/request');
+    expect((body as Record<string, unknown>).wizard_data).toBeUndefined();
+  });
+
+  it('launches the wizard when a for_request_access workflow is configured, then submits with merged wizard fields', async () => {
+    mockLookupWorkflowId.mockResolvedValue('wf-portable-1');
+
+    renderWithProviders(
+      <RequestProductActionDialog
+        isOpen={true}
+        onOpenChange={vi.fn()}
+        productId="prod-1"
+        productName="Test Product"
+        productStatus="active"
+      />,
+    );
+
+    // The reason field uses i18n keys for the label which may resolve to the
+    // raw key in tests; locate by the stable element id used in the source.
+    const reasonField = document.getElementById('access-message') as HTMLTextAreaElement;
+    expect(reasonField).not.toBeNull();
+    fireEvent.change(reasonField, { target: { value: 'Need access for the Q3 analytics rollup.' } });
+    fireEvent.click(screen.getByRole('button', { name: /Send Request/i }));
+
+    // Wizard mock should appear with the configured workflow id.
+    await waitFor(() => {
+      expect(screen.getByTestId('wizard-mock')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('wizard-mock').getAttribute('data-workflow-id')).toBe('wf-portable-1');
+    // Critical: API submit must NOT have happened yet.
+    expect(mockPost).not.toHaveBeenCalled();
+
+    // Drive wizard onComplete — synthesizes wizardFields = {custom_field, urgency}.
+    fireEvent.click(screen.getByTestId('wizard-complete-btn'));
+
+    await waitFor(() => {
+      expect(mockPost).toHaveBeenCalledTimes(1);
+    });
+    const [endpoint, body] = mockPost.mock.calls[0];
+    expect(endpoint).toBe('/api/access-grants/request');
+    const typed = body as Record<string, unknown>;
+    expect(typed.entity_type).toBe('data_product');
+    expect(typed.entity_id).toBe('prod-1');
+    expect(typed.wizard_data).toEqual({ custom_field: 'foo', urgency: 'high' });
+  });
+
+  it('skips the wizard for direct status changes (canDirectStatusChange=true)', async () => {
+    mockLookupWorkflowId.mockResolvedValue('wf-not-used');
+
+    renderWithProviders(
+      <RequestProductActionDialog
+        isOpen={true}
+        onOpenChange={vi.fn()}
+        productId="prod-1"
+        productName="Test Product"
+        productStatus="draft"
+        defaultRequestType="status_change"
+        canDirectStatusChange={true}
+      />,
+    );
+
+    // Direct status changes don't go through validation gates other than
+    // target_status — but the validateForm path requires it, so this test
+    // only asserts the wizard isn't even queried (lookup never fires for
+    // direct-status-change). Submit doesn't have to succeed for that.
+    fireEvent.click(screen.getByRole('button', { name: /Change Status/ }));
+    // Give microtasks a tick.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(mockLookupWorkflowId).not.toHaveBeenCalled();
   });
 });
