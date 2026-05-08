@@ -402,18 +402,111 @@ export default function RequestProductActionDialog({
     }
   };
 
+  /**
+   * Map of wizard-field-id → top-level payload key, per request type.
+   *
+   * When the wizard's ``user_action`` step collects a field whose id matches a
+   * known top-level field on the backend's request model, hoist it onto the
+   * payload root before submit. Without this, empty top-level fields fail
+   * Pydantic validation (e.g. ``AccessGrantRequestCreate.reason`` has
+   * ``min_length=10`` and the dialog form is hidden when a wizard is
+   * configured, so its top-level ``reason`` ships as ``''``).
+   *
+   * The hoist only fires when the top-level field is currently empty/falsy —
+   * we never overwrite a value the dialog already collected. Wizard fields
+   * still live in ``wizard_data`` so Process workflows can reference them via
+   * ``${entity.<field_id>}``; the hoist is purely additive.
+   */
+  const WIZARD_FIELD_HOIST: Record<RequestType, Record<string, string>> = {
+    access: {
+      reason: 'reason',
+      // Wizard authors commonly name the duration field one of these; map
+      // both onto the canonical ``requested_duration_days`` integer field.
+      expiry_days: 'requested_duration_days',
+      requested_duration_days: 'requested_duration_days',
+    },
+    review: { message: 'message' },
+    publish: {
+      justification: 'justification',
+      scope: 'scope',
+    },
+    certify: {
+      message: 'message',
+      certification_level: 'certification_level',
+    },
+    status_change: {
+      justification: 'justification',
+      target_status: 'target_status',
+    },
+  };
+
+  /** Numeric fields on the BE request body that need string→int coercion. */
+  const NUMERIC_TOP_LEVEL_FIELDS = new Set<string>([
+    'requested_duration_days',
+    'certification_level',
+  ]);
+
+  /**
+   * Hoist wizard-collected fields onto the top-level payload when the field id
+   * matches a known top-level field for the request type. Returns a new object;
+   * never mutates inputs. Empty strings on the wizard side are skipped so they
+   * don't clobber a non-empty dialog-side value.
+   */
+  const hoistWizardFieldsToPayload = (
+    payload: Record<string, unknown>,
+    wizardFields: Record<string, unknown>,
+    type: RequestType,
+  ): Record<string, unknown> => {
+    const map = WIZARD_FIELD_HOIST[type] ?? {};
+    const out: Record<string, unknown> = { ...payload };
+    for (const [wizardKey, topLevelKey] of Object.entries(map)) {
+      const wizardValue = wizardFields[wizardKey];
+      if (wizardValue === undefined || wizardValue === null) continue;
+      if (typeof wizardValue === 'string' && wizardValue.trim() === '') continue;
+      const existing = out[topLevelKey];
+      const existingIsEmpty =
+        existing === undefined ||
+        existing === null ||
+        (typeof existing === 'string' && existing.trim() === '');
+      // For numeric duration we override only when default 30 wasn't user-typed
+      // but rather the literal initial state — heuristic: hoist whenever wizard
+      // gave a value AND existing is empty OR field is the default-only path.
+      // Simpler rule: don't overwrite a non-empty existing value.
+      if (!existingIsEmpty) continue;
+      if (NUMERIC_TOP_LEVEL_FIELDS.has(topLevelKey) && typeof wizardValue === 'string') {
+        const parsed = parseInt(wizardValue, 10);
+        if (Number.isFinite(parsed)) {
+          out[topLevelKey] = parsed;
+        }
+        // Non-numeric string for a numeric field — silently drop (BE would 422).
+        continue;
+      }
+      out[topLevelKey] = wizardValue;
+    }
+    return out;
+  };
+
   const handleWizardComplete = async (
     _agreementId: string | null,
     _pdfStoragePath: string | null,
     wizardFields?: Record<string, unknown>,
   ) => {
     if (!pendingSubmit) return;
+    const fields = wizardFields ?? {};
+    // Step 1: hoist matching wizard fields onto the top-level payload so BE
+    // request-model validation (e.g. ``reason`` min_length on access requests)
+    // doesn't reject submissions that route their input through the wizard.
+    const hoisted = hoistWizardFieldsToPayload(
+      pendingSubmit.payload,
+      fields,
+      pendingSubmit.requestType,
+    );
     const merged = {
-      ...pendingSubmit.payload,
-      // Wizard-collected fields land in a dedicated namespace so the BE can
-      // forward them into ``entity_data`` for downstream Process workflows
+      ...hoisted,
+      // Step 2: keep the full wizard map under ``wizard_data`` so the BE can
+      // forward it into ``entity_data`` for downstream Process workflows
       // without colliding with first-class request fields (reason, duration).
-      wizard_data: wizardFields ?? {},
+      wizard_data: fields,
     };
     setWizardOpen(false);
     setWizardWorkflowId(null);
