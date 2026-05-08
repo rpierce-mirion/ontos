@@ -9,7 +9,7 @@ import { useToast } from '@/hooks/use-toast';
 import { useApi } from '@/hooks/use-api';
 import { useApprovalWizardTrigger, type AppActionTriggerType } from '@/hooks/use-approval-wizard-trigger';
 import { useNotificationsStore } from '@/stores/notifications-store';
-import { Loader2, AlertCircle, FileText, Eye, Rocket, RefreshCw, ShieldCheck } from 'lucide-react';
+import { Loader2, AlertCircle, FileText, Eye, Rocket, RefreshCw, ShieldCheck, Info } from 'lucide-react';
 import AccessRequestFields from '@/components/access/access-request-fields';
 import ApprovalWizardDialog from '@/components/workflows/approval-wizard-dialog';
 
@@ -147,8 +147,39 @@ export default function RequestProductActionDialog({
       setSelectedDuration(30);
       setCertificationLevel(null);
       setPublicationScope('organization');
+      setWizardWorkflowId(null);
     }
   }, [isOpen, defaultRequestType]);
+
+  /**
+   * Resolve the configured approval workflow for the current request type at
+   * dialog-open time (and on request-type changes). When a wizard is
+   * configured, the dialog hides its own form fields so the user isn't asked
+   * for the same input twice (e.g. typing a reason in both the dialog and the
+   * wizard's user_action step). When none is configured — or lookup fails —
+   * we leave wizardWorkflowId=null and the legacy direct-submit form renders.
+   *
+   * Direct status changes (admin path) skip the lookup entirely: that flow
+   * always bypasses the wizard regardless of configuration.
+   */
+  useEffect(() => {
+    if (!isOpen) return;
+    if (requestType === 'status_change' && canDirectStatusChange) {
+      setWizardWorkflowId(null);
+      return;
+    }
+    let cancelled = false;
+    const triggerType = REQUEST_TYPE_TO_TRIGGER[requestType];
+    (async () => {
+      try {
+        const id = await lookupWorkflowId(triggerType);
+        if (!cancelled) setWizardWorkflowId(id);
+      } catch {
+        if (!cancelled) setWizardWorkflowId(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isOpen, requestType, canDirectStatusChange, lookupWorkflowId]);
 
   const getRequestTypeConfig = (type: RequestType) => {
     switch (type) {
@@ -337,13 +368,19 @@ export default function RequestProductActionDialog({
   };
 
   const handleSubmit = async () => {
-    if (!validateForm()) {
-      return;
-    }
-
     const config = getRequestTypeConfig(requestType);
     if (!config.enabled) {
       setError(`Cannot request ${requestType} for a product with status '${productStatus}'`);
+      return;
+    }
+
+    // When a wizard is configured for this request type, the wizard owns all
+    // user input — skip dialog-side field validation so the dialog doesn't
+    // reject empty fields it isn't going to collect anyway. The base payload
+    // built here is merged with wizard-collected fields on completion.
+    const wizardActive = !!wizardWorkflowId
+      && !(requestType === 'status_change' && canDirectStatusChange);
+    if (!wizardActive && !validateForm()) {
       return;
     }
 
@@ -356,22 +393,9 @@ export default function RequestProductActionDialog({
       return;
     }
 
-    // Try to launch the approval wizard for this request type. When no
-    // workflow is configured (or lookup fails), fall through to direct submit.
-    const triggerType = REQUEST_TYPE_TO_TRIGGER[requestType];
-    setSubmitting(true);
-    let workflowId: string | null = null;
-    try {
-      workflowId = await lookupWorkflowId(triggerType);
-    } catch {
-      workflowId = null;
-    }
-    setSubmitting(false);
-
-    if (workflowId) {
+    if (wizardActive) {
       // Stash the submit context so onComplete can replay it with merged fields.
       setPendingSubmit({ endpoint: config.endpoint, payload, requestType });
-      setWizardWorkflowId(workflowId);
       setWizardOpen(true);
     } else {
       await executeSubmit(config.endpoint, payload, requestType);
@@ -399,6 +423,11 @@ export default function RequestProductActionDialog({
 
   const allowedTransitions = productStatus ? getAllowedTransitions(productStatus) : [];
   const config = getRequestTypeConfig(requestType);
+  // Direct status changes always render their form (admin path bypasses the wizard).
+  const isDirectStatusChange = requestType === 'status_change' && canDirectStatusChange;
+  // When true, the wizard owns user input — hide per-request-type form fields
+  // and skip dialog-side validation. See the lookup effect above.
+  const wizardActive = !!wizardWorkflowId && !isDirectStatusChange;
 
   return (
     <>
@@ -459,8 +488,23 @@ export default function RequestProductActionDialog({
             <p className="text-xs text-muted-foreground">{config.description}</p>
           </div>
 
-          {/* Status Change Fields */}
-          {requestType === 'status_change' && (
+          {/* Wizard-configured notice — replaces the per-request-type form
+              when a `for_request_*` workflow is wired up, since the wizard
+              collects all input itself (preventing the duplicate-prompt UX
+              that surfaced during Path B testing). */}
+          {wizardActive && (
+            <Alert>
+              <Info className="h-4 w-4" />
+              <AlertDescription>
+                A multi-step wizard is configured for this request. Click
+                {' '}<strong>Continue</strong>{' '}to begin.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {/* Status Change Fields — shown for direct status change always, and
+              for status-change requests only when no wizard is configured. */}
+          {requestType === 'status_change' && (isDirectStatusChange || !wizardActive) && (
             <div className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="target-status">Target Status *</Label>
@@ -504,7 +548,7 @@ export default function RequestProductActionDialog({
           )}
 
           {/* Access Request Fields - using shared component */}
-          {requestType === 'access' && (
+          {requestType === 'access' && !wizardActive && (
             <AccessRequestFields
               entityType="data_product"
               message={message}
@@ -516,7 +560,7 @@ export default function RequestProductActionDialog({
           )}
 
           {/* Review Request Message */}
-          {requestType === 'review' && (
+          {requestType === 'review' && !wizardActive && (
             <div className="space-y-2">
               <Label htmlFor="review-message">Message (optional)</Label>
               <Textarea
@@ -531,7 +575,7 @@ export default function RequestProductActionDialog({
           )}
 
           {/* Publish Request — scope + justification */}
-          {requestType === 'publish' && (
+          {requestType === 'publish' && !wizardActive && (
             <div className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="pub-scope">Publication Scope *</Label>
@@ -561,7 +605,7 @@ export default function RequestProductActionDialog({
             </div>
           )}
 
-          {requestType === 'certify' && (
+          {requestType === 'certify' && !wizardActive && (
             <div className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="cert-level">Certification Level *</Label>
@@ -614,10 +658,10 @@ export default function RequestProductActionDialog({
             {submitting ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                {requestType === 'status_change' && canDirectStatusChange ? 'Changing Status...' : 'Sending Request...'}
+                {isDirectStatusChange ? 'Changing Status...' : (wizardActive ? 'Opening...' : 'Sending Request...')}
               </>
             ) : (
-              requestType === 'status_change' && canDirectStatusChange ? 'Change Status' : 'Send Request'
+              isDirectStatusChange ? 'Change Status' : (wizardActive ? 'Continue' : 'Send Request')
             )}
           </Button>
         </DialogFooter>
@@ -633,9 +677,11 @@ export default function RequestProductActionDialog({
           setWizardOpen(open);
           if (!open && pendingSubmit) {
             // User dismissed wizard mid-flow — drop the pending submit so the
-            // dialog stays open for the user to retry/cancel.
+            // dialog stays open for the user to retry/cancel. We keep
+            // wizardWorkflowId so the "wizard configured" notice and Continue
+            // button remain (the wizard config didn't change just because the
+            // user dismissed the modal).
             setPendingSubmit(null);
-            setWizardWorkflowId(null);
           }
         }}
         entityType="data_product"

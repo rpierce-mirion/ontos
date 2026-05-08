@@ -193,12 +193,20 @@ describe('RequestProductActionDialog approval-wizard launch (Path B)', () => {
       />,
     );
 
-    // The reason field uses i18n keys for the label which may resolve to the
-    // raw key in tests; locate by the stable element id used in the source.
-    const reasonField = document.getElementById('access-message') as HTMLTextAreaElement;
-    expect(reasonField).not.toBeNull();
-    fireEvent.change(reasonField, { target: { value: 'Need access for the Q3 analytics rollup.' } });
-    fireEvent.click(screen.getByRole('button', { name: /Send Request/i }));
+    // Lookup runs at dialog-open time — wait for it to resolve before
+    // asserting the wizard-configured branch took effect.
+    await waitFor(() => {
+      expect(mockLookupWorkflowId).toHaveBeenCalledWith('for_request_access');
+    });
+
+    // Form fields must NOT be rendered when wizard is configured (this is the
+    // duplicate-prompt fix — wizard owns user input).
+    await waitFor(() => {
+      expect(document.getElementById('access-message')).toBeNull();
+    });
+    // Submit button label flips to "Continue" to set the right expectation.
+    const continueBtn = await screen.findByRole('button', { name: /Continue/i });
+    fireEvent.click(continueBtn);
 
     // Wizard mock should appear with the configured workflow id.
     await waitFor(() => {
@@ -220,6 +228,67 @@ describe('RequestProductActionDialog approval-wizard launch (Path B)', () => {
     expect(typed.entity_type).toBe('data_product');
     expect(typed.entity_id).toBe('prod-1');
     expect(typed.wizard_data).toEqual({ custom_field: 'foo', urgency: 'high' });
+    // The base payload comes from buildPayload — reason is empty because the
+    // user never typed it (wizard was supposed to collect it). That's fine:
+    // the wizard's user_action step writes its own reason into wizard_data.
+    expect(typed.reason).toBe('');
+  });
+
+  it('shows wizard-configured notice and skips dialog-side validation when wizard is configured', async () => {
+    mockLookupWorkflowId.mockResolvedValue('wf-portable-1');
+
+    renderWithProviders(
+      <RequestProductActionDialog
+        isOpen={true}
+        onOpenChange={vi.fn()}
+        productId="prod-1"
+        productName="Test Product"
+        productStatus="active"
+      />,
+    );
+
+    // Notice is rendered (uses the existing Alert + Info icon pattern).
+    await waitFor(() => {
+      expect(
+        screen.getByText(/multi-step wizard is configured/i),
+      ).toBeInTheDocument();
+    });
+
+    // Dialog's own access form is suppressed — no reason textarea anywhere.
+    expect(document.getElementById('access-message')).toBeNull();
+
+    // Click Continue with no input — wizard should open (no validation error).
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    await waitFor(() => {
+      expect(screen.getByTestId('wizard-mock')).toBeInTheDocument();
+    });
+    // No "Please provide a reason" error rendered since validation was skipped.
+    expect(screen.queryByText(/Please provide a reason/i)).toBeNull();
+  });
+
+  it('preserves direct-status-change form when canDirectStatusChange is true (skips wizard lookup)', async () => {
+    mockLookupWorkflowId.mockResolvedValue('wf-not-used');
+
+    renderWithProviders(
+      <RequestProductActionDialog
+        isOpen={true}
+        onOpenChange={vi.fn()}
+        productId="prod-1"
+        productName="Test Product"
+        productStatus="draft"
+        defaultRequestType="status_change"
+        canDirectStatusChange={true}
+      />,
+    );
+
+    // Direct status change must NOT trigger the wizard lookup at open time
+    // (admin path bypasses the wizard regardless of config).
+    await new Promise((r) => setTimeout(r, 0));
+    expect(mockLookupWorkflowId).not.toHaveBeenCalled();
+    // No wizard-configured notice.
+    expect(screen.queryByText(/multi-step wizard is configured/i)).toBeNull();
+    // Submit button stays as direct-change variant.
+    expect(screen.getByRole('button', { name: /Change Status/ })).toBeInTheDocument();
   });
 
   it('skips the wizard for direct status changes (canDirectStatusChange=true)', async () => {
