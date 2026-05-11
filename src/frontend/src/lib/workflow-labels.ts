@@ -277,6 +277,16 @@ export const SUPPORTED_TRIGGER_ENTITY_MAP: Record<string, string[]> = {
   // Access lifecycle
   on_expiring: ['access_grant'],
   on_revoke: ['access_grant'],
+  // Wizard (user-action-triggered) variants — PR #353
+  // These triggers fire on user action (button click), not platform event,
+  // and the workflow runs *before* the underlying record is created. Entity
+  // types reflect the contexts from which the action can be invoked today.
+  for_subscribe: ['data_product'],
+  for_request_access: ['data_product', 'access_grant'],
+  for_request_review: ['data_product', 'data_contract', 'data_asset_review'],
+  for_request_publish: ['data_product', 'data_contract'],
+  for_request_certify: ['data_product', 'data_contract'],
+  for_request_status_change: ['data_product'],
   // Manual/scheduled — always supported (no entity dependency)
   scheduled: [],
   manual: [],

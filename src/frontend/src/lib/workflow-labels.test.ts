@@ -1,0 +1,103 @@
+/**
+ * Unit tests for workflow-labels helpers.
+ *
+ * Created alongside the for_* trigger entity-map update so the "trigger–entity
+ * combination is not wired" warning does not fire for valid wizard combos.
+ */
+import { describe, it, expect } from 'vitest';
+import {
+  isTriggerEntitySupported,
+  resolveRecipientDisplay,
+  SUPPORTED_TRIGGER_ENTITY_MAP,
+} from './workflow-labels';
+
+describe('isTriggerEntitySupported', () => {
+  describe('for_* wizard triggers', () => {
+    // PR #353 follow-up: ensure the warning does not fire for any of the
+    // wizard-triggered (`for_*`) entries on their valid entity types.
+    it('accepts for_subscribe + data_product', () => {
+      expect(isTriggerEntitySupported('for_subscribe', 'data_product')).toBe(true);
+    });
+
+    it('accepts for_request_access + data_product / access_grant', () => {
+      expect(isTriggerEntitySupported('for_request_access', 'data_product')).toBe(true);
+      expect(isTriggerEntitySupported('for_request_access', 'access_grant')).toBe(true);
+    });
+
+    it('accepts for_request_review + data_product / data_contract / data_asset_review', () => {
+      expect(isTriggerEntitySupported('for_request_review', 'data_product')).toBe(true);
+      expect(isTriggerEntitySupported('for_request_review', 'data_contract')).toBe(true);
+      expect(isTriggerEntitySupported('for_request_review', 'data_asset_review')).toBe(true);
+    });
+
+    it('accepts for_request_publish + data_product / data_contract', () => {
+      expect(isTriggerEntitySupported('for_request_publish', 'data_product')).toBe(true);
+      expect(isTriggerEntitySupported('for_request_publish', 'data_contract')).toBe(true);
+    });
+
+    it('accepts for_request_certify + data_product / data_contract', () => {
+      expect(isTriggerEntitySupported('for_request_certify', 'data_product')).toBe(true);
+      expect(isTriggerEntitySupported('for_request_certify', 'data_contract')).toBe(true);
+    });
+
+    it('accepts for_request_status_change + data_product', () => {
+      expect(isTriggerEntitySupported('for_request_status_change', 'data_product')).toBe(true);
+    });
+
+    it('rejects for_subscribe + unrelated entity types', () => {
+      expect(isTriggerEntitySupported('for_subscribe', 'catalog')).toBe(false);
+      expect(isTriggerEntitySupported('for_subscribe', 'job')).toBe(false);
+    });
+
+    it('covers every for_* trigger declared in ALL_TRIGGER_TYPES', () => {
+      const forTriggers = [
+        'for_subscribe',
+        'for_request_access',
+        'for_request_review',
+        'for_request_publish',
+        'for_request_certify',
+        'for_request_status_change',
+      ];
+      for (const trigger of forTriggers) {
+        expect(SUPPORTED_TRIGGER_ENTITY_MAP[trigger]).toBeDefined();
+        expect(SUPPORTED_TRIGGER_ENTITY_MAP[trigger].length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  describe('existing triggers (regression)', () => {
+    it('still accepts on_create + table', () => {
+      expect(isTriggerEntitySupported('on_create', 'table')).toBe(true);
+    });
+
+    it('treats manual / scheduled as always-supported (empty array)', () => {
+      expect(isTriggerEntitySupported('manual', 'data_product')).toBe(true);
+      expect(isTriggerEntitySupported('scheduled', 'job')).toBe(true);
+    });
+
+    it('returns false for unknown triggers', () => {
+      expect(isTriggerEntitySupported('not_a_real_trigger', 'data_product')).toBe(false);
+    });
+  });
+});
+
+describe('resolveRecipientDisplay', () => {
+  it('returns "Not configured" when value is undefined', () => {
+    expect(resolveRecipientDisplay(undefined, {})).toBe('Not configured');
+  });
+
+  it('resolves special recipient keys', () => {
+    expect(resolveRecipientDisplay('requester', {})).toBe('Requester');
+    expect(resolveRecipientDisplay('owner', {})).toBe('Owner');
+    expect(resolveRecipientDisplay('admins', {})).toBe('Administrators');
+  });
+
+  it('resolves role UUIDs via rolesMap', () => {
+    const rolesMap = { 'uuid-1': 'Data Steward', 'uuid-2': 'Owner' };
+    expect(resolveRecipientDisplay('uuid-1', rolesMap)).toBe('Data Steward');
+  });
+
+  it('falls back to raw value when nothing matches', () => {
+    expect(resolveRecipientDisplay('alice@example.com', {})).toBe('alice@example.com');
+  });
+});
