@@ -100,4 +100,28 @@ describe('resolveRecipientDisplay', () => {
   it('falls back to raw value when nothing matches', () => {
     expect(resolveRecipientDisplay('alice@example.com', {})).toBe('alice@example.com');
   });
+
+  describe('business role resolution', () => {
+    // Backend `/api/workflows/roles` prefixes business role IDs with
+    // `business:<uuid>` already, so the unified rolesMap path covers most
+    // call sites. The businessRolesMap arg is the fallback for callers that
+    // hold a map keyed by raw UUID (e.g., direct `/api/business-roles` fetch).
+    it('resolves business:<uuid> via unified rolesMap (current designer path)', () => {
+      const rolesMap = { 'business:role-1': 'Domain Owner' };
+      expect(resolveRecipientDisplay('business:role-1', rolesMap)).toBe('Domain Owner');
+    });
+
+    it('resolves business:<uuid> via businessRolesMap fallback', () => {
+      expect(
+        resolveRecipientDisplay('business:abc-123', {}, { 'abc-123': 'Business Owner' })
+      ).toBe('Business Owner (business role)');
+    });
+
+    it('returns raw value when business: prefix is unresolvable', () => {
+      expect(resolveRecipientDisplay('business:unknown', {})).toBe('business:unknown');
+      expect(
+        resolveRecipientDisplay('business:unknown', {}, { 'other-uuid': 'Other' })
+      ).toBe('business:unknown');
+    });
+  });
 });

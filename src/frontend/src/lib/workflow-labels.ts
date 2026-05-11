@@ -318,24 +318,46 @@ export const SPECIAL_RECIPIENTS: Record<string, string> = {
 
 /**
  * Resolve an approver/recipient identifier to a display name.
- * Handles both UUIDs (resolved via roles map) and special values.
+ *
+ * Handles three identifier shapes:
+ *  - special keys (`requester`, `owner`, `admins`, …) → human label
+ *  - `business:<uuid>` → business role name (with " (business role)" suffix)
+ *  - bare UUID / `business:<uuid>` lookup in `rolesMap` (the workflow designer's
+ *    flat map populated from `/api/workflows/roles`, which already namespaces
+ *    business role IDs with the `business:` prefix on the backend)
+ *
+ * The optional `businessRolesMap` is a fallback for call sites that hold a map
+ * keyed by raw business role UUIDs (e.g., loaded from `/api/business-roles`
+ * directly). It lets the same helper resolve a `business:<uuid>` value even
+ * when the unified `rolesMap` is not available.
  */
 export function resolveRecipientDisplay(
   value: string | undefined,
-  rolesMap: Record<string, string>
+  rolesMap: Record<string, string>,
+  businessRolesMap?: Record<string, string>
 ): string {
   if (!value) return 'Not configured';
-  
+
   // Check special values first
   if (value in SPECIAL_RECIPIENTS) {
     return SPECIAL_RECIPIENTS[value];
   }
-  
-  // Check if it's a role UUID
+
+  // Check the unified rolesMap (which already includes `business:<uuid>` keys
+  // when populated from /api/workflows/roles)
   if (value in rolesMap) {
     return rolesMap[value];
   }
-  
+
+  // Explicit business: prefix handling — works even if only a flat
+  // businessRolesMap (keyed by raw UUID) was provided.
+  if (value.startsWith('business:')) {
+    const uuid = value.slice('business:'.length);
+    const name = businessRolesMap?.[uuid];
+    if (name) return `${name} (business role)`;
+    return value;
+  }
+
   // Fallback: return raw value (might be email or legacy role name)
   return value;
 }
